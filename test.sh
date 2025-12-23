@@ -5,7 +5,7 @@ cargo build
 PROGRAM=./target/debug/send-file
 
 # start sender in the background
-RUST_LOG=warn $PROGRAM send ./test-data/audio.webm &
+RUST_LOG=warn $PROGRAM -i alice send ./test-data/audio.webm &
 PID=$!
 
 trap "kill -SIGINT $PID" EXIT
@@ -20,7 +20,7 @@ echo Ticket: $TICKET
 
 
 # start receiver
-RUST_LOG=info $PROGRAM receive $TICKET ./test-data/received.webm
+RUST_LOG=info $PROGRAM -i bob receive $TICKET ./test-data/received.webm
 
 echo receiver done
 
