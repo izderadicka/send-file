@@ -1,10 +1,24 @@
-use std::path::{self, Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{self, Path, PathBuf},
+};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use iroh::{Endpoint, RelayMode, SecretKey, discovery::mdns::MdnsDiscovery, protocol::Router};
+use futures_lite::StreamExt as _;
+use iroh::{
+    Endpoint, EndpointAddr, RelayMode, SecretKey, discovery::mdns::MdnsDiscovery, protocol::Router,
+};
 use iroh_blobs::{BlobsProtocol, store::mem::MemStore, ticket::BlobTicket};
+use iroh_gossip::{
+    Gossip, TopicId,
+    api::{Event, GossipReceiver},
+};
 use tokio::{fs, io::AsyncWriteExt as _};
+
+use crate::channel::{Message, MessageBody, Ticket};
+
+mod channel;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -27,6 +41,10 @@ enum Command {
         ticket: String,
         #[arg(required = true)]
         file: PathBuf,
+    },
+    Publish,
+    Subscribe {
+        ticket: String,
     },
 }
 
@@ -92,7 +110,112 @@ async fn main() -> Result<()> {
             store.blobs().export(ticket.hash(), output_file).await?;
             endpoint.close().await;
         }
+
+        Command::Publish => {
+            let topic = TopicId::from_bytes(rand::random());
+            let endpoints: Vec<EndpointAddr> = vec![];
+
+            chat_main(args.identity.clone(), endpoint, topic, endpoints).await?
+        }
+        Command::Subscribe { ticket } => {
+            let ticket: Ticket = ticket.parse().context("Invalid ticket")?;
+            chat_main(
+                args.identity.clone(),
+                endpoint,
+                ticket.topic,
+                ticket.endpoints,
+            )
+            .await?
+        }
     }
 
     Ok(())
+}
+
+async fn chat_main(
+    identity: String,
+    endpoint: Endpoint,
+    topic: TopicId,
+    endpoints: Vec<EndpointAddr>,
+) -> Result<()> {
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let router = Router::builder(endpoint.clone())
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
+    let ticket = Ticket {
+        topic: topic.clone(),
+        endpoints: vec![endpoint.id().into()],
+    };
+    let ticket = ticket.to_string();
+    println!("Ticket: \n{}", ticket);
+    fs::write("./test-data/chat_ticket.txt", ticket).await?;
+
+    if endpoints.is_empty() {
+        println!("Waiting somebody joins our channel")
+    } else {
+        println!("Waiting to join channel")
+    }
+
+    let endpoint_ids: Vec<_> = endpoints.iter().map(|ep| ep.id).collect();
+    let (sender, receiver) = gossip
+        .subscribe_and_join(topic, endpoint_ids)
+        .await?
+        .split();
+    println!("Connected - start chat below");
+    println!("------------------------------------");
+    let message = Message::new_intro(endpoint.id(), identity);
+    let data: Vec<u8> = (&message).into();
+    sender.broadcast(data.into()).await?;
+
+    tokio::spawn(message_loop(receiver));
+
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(1);
+    std::thread::spawn(move || input_loop(input_sender));
+    while let Some(line) = input_receiver.recv().await {
+        let message = Message::new_message(endpoint.id(), line);
+        let data: Vec<u8> = (&message).into();
+        sender.broadcast(data.into()).await?;
+    }
+
+    router.shutdown().await?;
+    Ok(())
+}
+
+async fn message_loop(mut receiver: GossipReceiver) -> Result<()> {
+    let mut directory: HashMap<_, String> = HashMap::new();
+    while let Some(event) = receiver.next().await {
+        let event = event?;
+        match event {
+            Event::Received(msg) => {
+                let message: Message = Message::try_from(msg.content.as_ref())?;
+                match message.body {
+                    MessageBody::Message { from, text } => {
+                        let short_id = from.fmt_short().to_string();
+                        let name = directory
+                            .get(&from)
+                            .map(|name| format!("[{name}:{short_id}]"))
+                            .unwrap_or_else(|| format!("[{short_id}]"));
+                        println!("<< {}: {}", name, text);
+                    }
+                    MessageBody::Intro { from, name } => {
+                        println!("<< User {} joined with name {}", from, name);
+                        directory.insert(from, name);
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
+fn input_loop(sender: tokio::sync::mpsc::Sender<String>) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        // print!("\n>> ");
+        stdin.read_line(&mut buf)?;
+        sender.blocking_send(buf.trim_end().to_string())?;
+        buf.clear();
+    }
 }
