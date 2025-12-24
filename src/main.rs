@@ -79,12 +79,10 @@ async fn main() -> Result<()> {
         .discovery(mdns);
     let endpoint = builder.bind().await?;
 
-    let store = MemStore::new();
-
-    let blobs = BlobsProtocol::new(&store, None);
-
     match args.command {
         Command::Send { file } => {
+            let store = MemStore::new();
+            let blobs = BlobsProtocol::new(&store, None);
             let tag = store.add_path(path::absolute(&file)?).await?;
             let ticket = BlobTicket::new(endpoint.id().into(), tag.hash, tag.format);
             let ticket = ticket.to_string();
@@ -101,6 +99,7 @@ async fn main() -> Result<()> {
             router.shutdown().await?;
         }
         Command::Receive { ticket, file } => {
+            let store = MemStore::new();
             let ticket: BlobTicket = ticket.parse()?;
             let output_file = path::absolute(&file)?;
             let downloader = store.downloader(&endpoint);
