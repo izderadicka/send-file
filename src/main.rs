@@ -7,7 +7,8 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt as _;
 use iroh::{
-    Endpoint, EndpointAddr, RelayMode, SecretKey, discovery::mdns::MdnsDiscovery, protocol::Router,
+    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMode, SecretKey,
+    discovery::mdns::MdnsDiscovery, protocol::Router,
 };
 use iroh_blobs::{BlobsProtocol, store::mem::MemStore, ticket::BlobTicket};
 use iroh_gossip::{
@@ -162,16 +163,20 @@ async fn chat_main(
         .split();
     println!("Connected - start chat below");
     println!("------------------------------------");
-    let message = Message::new_intro(endpoint.id(), identity);
+    let message = Message::new_intro(endpoint.id(), identity.clone());
     let data: Vec<u8> = (&message).into();
     sender.broadcast(data.into()).await?;
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel::<Message>(1);
 
-    tokio::spawn(message_loop(receiver));
+    tokio::spawn(message_loop(
+        receiver,
+        input_sender.clone(),
+        endpoint.id(),
+        identity,
+    ));
 
-    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(1);
-    std::thread::spawn(move || input_loop(input_sender));
-    while let Some(line) = input_receiver.recv().await {
-        let message = Message::new_message(endpoint.id(), line);
+    std::thread::spawn(move || input_loop(input_sender, endpoint.id()));
+    while let Some(message) = input_receiver.recv().await {
         let data: Vec<u8> = (&message).into();
         sender.broadcast(data.into()).await?;
     }
@@ -180,7 +185,12 @@ async fn chat_main(
     Ok(())
 }
 
-async fn message_loop(mut receiver: GossipReceiver) -> Result<()> {
+async fn message_loop(
+    mut receiver: GossipReceiver,
+    input_sender: tokio::sync::mpsc::Sender<Message>,
+    my_id: EndpointId,
+    identity: String,
+) -> Result<()> {
     let mut directory: HashMap<_, String> = HashMap::new();
     while let Some(event) = receiver.next().await {
         let event = event?;
@@ -197,24 +207,45 @@ async fn message_loop(mut receiver: GossipReceiver) -> Result<()> {
                         println!("<< {}: {}", name, text);
                     }
                     MessageBody::Intro { from, name } => {
-                        println!("<< User {} joined with name {}", from, name);
-                        directory.insert(from, name);
+                        let existing = directory.insert(from, name.clone());
+                        if let Some(old_name) = existing {
+                            if old_name != name {
+                                println!(
+                                    "<< User {} changed name from {} to {}",
+                                    from, old_name, name
+                                );
+                            }
+                        } else {
+                            println!("<< User {} joined with name {}", from, name);
+                        }
                     }
                 }
             }
-            _ => (),
+            Event::NeighborUp(id) => {
+                println!("<< New user {} just joined", id.fmt_short());
+                let intro = Message::new_intro(my_id, identity.clone());
+                input_sender.send(intro).await?;
+            }
+            Event::NeighborDown(id) => {
+                println!("<< User {} just left", id.fmt_short());
+            }
+            Event::Lagged => {
+                println!("<< Lagged - some messages were lost");
+            }
         }
     }
     Ok(())
 }
 
-fn input_loop(sender: tokio::sync::mpsc::Sender<String>) -> Result<()> {
+fn input_loop(sender: tokio::sync::mpsc::Sender<Message>, id: EndpointId) -> Result<()> {
     let stdin = std::io::stdin();
     let mut buf = String::new();
     loop {
         // print!("\n>> ");
         stdin.read_line(&mut buf)?;
-        sender.blocking_send(buf.trim_end().to_string())?;
+        let text = buf.trim_end().to_string();
+        let msg = Message::new_message(id, text);
+        sender.blocking_send(msg)?;
         buf.clear();
     }
 }
