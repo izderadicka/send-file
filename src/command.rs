@@ -4,8 +4,13 @@ use crate::channel::Message;
 use anyhow::{anyhow, bail};
 
 pub enum Command {
-    Share { file: String },
-    Download { ticket: String },
+    Share {
+        file: String,
+    },
+    Download {
+        ticket: String,
+        output_file: Option<String>,
+    },
     Message(Message),
     Quit,
 }
@@ -23,12 +28,17 @@ impl FromStr for Command {
                         .ok_or_else(|| anyhow!("Missing part"))?
                         .to_string(),
                 }),
-                "#download" | "#d" => Ok(Command::Download {
-                    ticket: parts
-                        .next()
-                        .ok_or_else(|| anyhow!("Missing part"))?
-                        .to_string(),
-                }),
+                "#download" | "#d" => {
+                    let params = parts.next().ok_or_else(|| anyhow!("Missing part"))?;
+                    let mut parts = params.splitn(2, ' ');
+                    Ok(Command::Download {
+                        ticket: parts
+                            .next()
+                            .ok_or_else(|| anyhow!("Missing part"))?
+                            .to_string(),
+                        output_file: parts.next().map(|s| s.to_string()),
+                    })
+                }
                 "#quit" | "#q" => Ok(Command::Quit),
                 cmd => bail!("Unknown command {cmd}"),
             }

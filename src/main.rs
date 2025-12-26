@@ -17,6 +17,7 @@ use tracing::error;
 
 use crate::{
     channel::{Message, MessageBody, MessageEnvelope, Ticket},
+    command::Command,
     context::Context,
 };
 
@@ -121,7 +122,7 @@ async fn run(context: Context) -> Result<()> {
         .spawn();
 
     let (sender, receiver) = start_chat(&context, gossip).await?;
-    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel::<Message>(1);
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel::<Command>(1);
 
     tokio::spawn(message_loop(
         receiver,
@@ -130,9 +131,23 @@ async fn run(context: Context) -> Result<()> {
     ));
 
     std::thread::spawn(move || input_loop(input_sender));
-    while let Some(message) = input_receiver.recv().await {
-        let data: Vec<u8> = message.sign_and_encode(endpoint.secret_key())?;
-        sender.broadcast(data.into()).await?;
+
+    while let Some(cmd) = input_receiver.recv().await {
+        match cmd {
+            Command::Share { file } => todo!(),
+            Command::Download {
+                ticket,
+                output_file,
+            } => todo!(),
+            Command::Message(message) => {
+                let data: Vec<u8> = message.sign_and_encode(endpoint.secret_key())?;
+                sender.broadcast(data.into()).await?;
+            }
+            Command::Quit => {
+                println!("!! Goodbye");
+                break;
+            }
+        }
     }
     router.shutdown().await?;
     Ok(())
@@ -172,7 +187,7 @@ async fn start_chat(
 
 async fn message_loop(
     mut receiver: GossipReceiver,
-    input_sender: tokio::sync::mpsc::Sender<Message>,
+    input_sender: tokio::sync::mpsc::Sender<Command>,
     context: Context,
 ) -> Result<()> {
     let mut directory: HashMap<_, String> = HashMap::new();
@@ -214,6 +229,7 @@ async fn message_loop(
             Event::NeighborUp(id) => {
                 println!("<< New user {} just joined", id.fmt_short());
                 let intro = Message::new_intro(context.identity().into());
+                let intro = Command::Message(intro);
                 input_sender.send(intro).await?;
             }
             Event::NeighborDown(id) => {
@@ -227,7 +243,7 @@ async fn message_loop(
     Ok(())
 }
 
-fn input_loop(sender: tokio::sync::mpsc::Sender<Message>) -> Result<()> {
+fn input_loop(sender: tokio::sync::mpsc::Sender<Command>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut buf = String::new();
     loop {
@@ -235,8 +251,11 @@ fn input_loop(sender: tokio::sync::mpsc::Sender<Message>) -> Result<()> {
         stdin.read_line(&mut buf)?;
         let text = buf.trim_end().to_string();
         if !text.is_empty() {
-            let msg = Message::new_message(text);
-            sender.blocking_send(msg)?;
+            let parsed: Result<Command, _> = text.parse();
+            match parsed {
+                Ok(cmd) => sender.blocking_send(cmd)?,
+                Err(e) => println!("!! Invalid command {text}, error: {e}"),
+            }
         }
         buf.clear();
     }
