@@ -20,8 +20,9 @@ use iroh_blobs::store::{
 };
 use iroh_gossip::TopicId;
 use tokio::fs;
+use tracing::error;
 
-use crate::Args;
+use crate::{Args, channel::Message, command::Command};
 
 #[derive(Clone)]
 pub struct PeersDirectory {
@@ -35,25 +36,31 @@ impl PeersDirectory {
         }
     }
 
-    pub fn add_peer(&self, public_key: PublicKey, name: String) {
-        self.inner.write().unwrap().add_peer(public_key, name);
+    pub fn add_peer(&self, public_key: PublicKey, name: String) -> Option<Arc<str>> {
+        self.inner.write().unwrap().add_peer(public_key, name)
     }
 
-    pub fn find_by_id(&self, public_key: &PublicKey) -> Option<String> {
-        self.inner
-            .read()
-            .unwrap()
-            .find_by_id(public_key)
-            .map(|s| s.to_string())
+    pub fn find_by_id(&self, public_key: &PublicKey) -> Option<Arc<str>> {
+        let db = self.inner.read().unwrap();
+        db.find_by_id(public_key)
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<PublicKey> {
         self.inner.read().unwrap().find_by_name(name).cloned()
     }
+
+    pub fn friendly_name(&self, id: &PublicKey) -> String {
+        let short_id = id.fmt_short().to_string();
+        let name = self
+            .find_by_id(&id)
+            .map(|name| format!("[{name}:{short_id}]"))
+            .unwrap_or_else(|| format!("[{short_id}]"));
+        name
+    }
 }
 
 struct PeersDirectoryInner {
-    peers: HashMap<PublicKey, String>,
+    peers: HashMap<PublicKey, Arc<str>>,
     names: HashMap<String, PublicKey>,
 }
 
@@ -65,13 +72,14 @@ impl PeersDirectoryInner {
         }
     }
 
-    fn add_peer(&mut self, public_key: PublicKey, name: String) {
-        self.peers.insert(public_key, name.clone());
+    fn add_peer(&mut self, public_key: PublicKey, name: String) -> Option<Arc<str>> {
+        let existing = self.peers.insert(public_key, Arc::from(name.as_str()));
         self.names.insert(name, public_key);
+        existing
     }
 
-    fn find_by_id(&self, public_key: &PublicKey) -> Option<&str> {
-        self.peers.get(public_key).map(|name| name.as_str())
+    fn find_by_id(&self, public_key: &PublicKey) -> Option<Arc<str>> {
+        self.peers.get(public_key).cloned()
     }
 
     fn find_by_name(&self, name: &str) -> Option<&PublicKey> {
@@ -110,16 +118,29 @@ async fn load_identity(data_dir: &Path, name: &str) -> Result<SecretKey> {
     }
 }
 
-async fn init_endpoint(data_dir: &Path, identity: &str) -> Result<Endpoint> {
-    let secret_key = load_identity(data_dir, identity).await?;
-    let mdns = MdnsDiscovery::builder();
-    // let dht_discovery = iroh::discovery::pkarr::dht::DhtDiscovery::builder()
-    //     .secret_key(secret_key.clone())
-    //     .include_direct_addresses(true);
-    let builder = Endpoint::empty_builder(RelayMode::Disabled)
-        .secret_key(secret_key)
-        // .discovery(dht_discovery);
-        .discovery(mdns);
+async fn init_endpoint(args: &Args) -> Result<Endpoint> {
+    let secret_key = load_identity(&args.data_dir, &args.identity).await?;
+
+    let mut builder = if args.disable_relays {
+        Endpoint::empty_builder(RelayMode::Disabled)
+    } else {
+        Endpoint::builder().relay_mode(RelayMode::Default)
+    };
+
+    builder = builder.secret_key(secret_key.clone());
+
+    if !args.disable_mdns {
+        let mdns = MdnsDiscovery::builder();
+        builder = builder.discovery(mdns);
+    }
+
+    if args.enable_dht {
+        let dht_discovery = iroh::discovery::pkarr::dht::DhtDiscovery::builder()
+            .secret_key(secret_key.clone())
+            .include_direct_addresses(args.disable_relays);
+        builder = builder.discovery(dht_discovery);
+    }
+
     let endpoint = builder.bind().await?;
     Ok(endpoint)
 }
@@ -134,11 +155,13 @@ impl Context {
         args: &Args,
         topic_id: TopicId,
         topic_endpoints: Vec<EndpointAddr>,
+        output_sender: tokio::sync::mpsc::Sender<String>,
+        input_sender: tokio::sync::mpsc::Sender<Command>,
     ) -> Result<Self> {
         let peers = PeersDirectory::new();
         let store = init_store(&args.data_dir, &args.identity).await?;
 
-        let endpoint = init_endpoint(&args.data_dir, &args.identity).await?;
+        let endpoint = init_endpoint(&args).await?;
 
         let downloader = store.downloader(&endpoint);
         Ok(Context {
@@ -151,6 +174,8 @@ impl Context {
                 topic_endpoints,
                 identity: args.identity.clone(),
                 data_dir: args.data_dir.clone(),
+                output_sender,
+                input_sender,
             }),
         })
     }
@@ -186,6 +211,32 @@ impl Context {
     pub fn data_dir(&self) -> &Path {
         self.inner.data_dir.as_path()
     }
+
+    pub async fn print(&self, msg: String) {
+        self.inner
+            .output_sender
+            .send(msg)
+            .await
+            .inspect_err(|_| error!("Cannot print"))
+            .ok();
+    }
+
+    pub fn input_sender(&self) -> tokio::sync::mpsc::Sender<Command> {
+        self.inner.input_sender.clone()
+    }
+
+    pub async fn send_command(&self, cmd: Command) {
+        self.inner
+            .input_sender
+            .send(cmd)
+            .await
+            .inspect_err(|_| error!("Cannot send command"))
+            .ok();
+    }
+
+    pub async fn send_message(&self, msg: Message) {
+        self.send_command(Command::Message(msg)).await;
+    }
 }
 
 struct ContextInner {
@@ -197,4 +248,6 @@ struct ContextInner {
     topic_endpoints: Vec<EndpointAddr>,
     identity: String,
     data_dir: PathBuf,
+    output_sender: tokio::sync::mpsc::Sender<String>,
+    input_sender: tokio::sync::mpsc::Sender<Command>,
 }

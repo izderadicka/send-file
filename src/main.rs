@@ -1,13 +1,10 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt as _;
 use iroh::{EndpointAddr, protocol::Router};
-use iroh_blobs::BlobsProtocol;
+use iroh_blobs::{BlobsProtocol, ticket::BlobTicket};
 use iroh_gossip::{
     Gossip, TopicId,
     api::{Event, GossipReceiver},
@@ -33,6 +30,12 @@ struct Args {
     identity: String,
     #[arg(long, short, help = "Enforce creation of new topic", action = clap::ArgAction::SetTrue)]
     new_topic: bool,
+    #[arg(long, help = "Disable mdns (local LAN) discovery", action = clap::ArgAction::SetTrue)]
+    disable_mdns: bool,
+    #[arg(long, help = "Enable DHT discovery (your record will be published in BitTorrent Mainline DHT)", action = clap::ArgAction::SetTrue)]
+    enable_dht: bool,
+    #[arg(long, help = "Disable public (number-0) relays", action = clap::ArgAction::SetTrue)]
+    disable_relays: bool,
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -56,9 +59,26 @@ async fn load_topic(data_dir: &Path, new_topic: bool) -> Result<TopicId> {
     }
 }
 
+macro_rules! output {
+    ($context:ident, $($arg:tt)*) => {
+        {
+        let msg = format!($($arg)*);
+        $context.print(msg).await;
+        }
+
+    };
+}
+
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let args = Args::parse();
 
     let (topic, endpoints) = match args.command {
@@ -73,41 +93,61 @@ async fn main() -> Result<()> {
             (ticket.topic, ticket.endpoints)
         }
     };
+    let (output_sender, output_receiver) = tokio::sync::mpsc::channel(8);
+    let (input_sender, input_receiver) = tokio::sync::mpsc::channel::<Command>(1);
+    let context = Context::new(&args, topic, endpoints, output_sender, input_sender).await?;
 
-    let context = Context::new(&args, topic, endpoints).await?;
-
-    run(context).await?;
+    run(context, output_receiver, input_receiver).await?;
     Ok(())
 }
 
-//TODO - extract to funcions
-// CliCommand::Send { file } => {
-//             let tag = store.add_path(path::absolute(&file)?).await?;
-//             let ticket = BlobTicket::new(endpoint.id().into(), tag.hash, tag.format);
-//             let ticket = ticket.to_string();
-//             let file = tokio::fs::File::create("./test-data/file_ticket.txt").await?;
-//             let mut file = tokio::io::BufWriter::new(file);
-//             file.write_all(ticket.as_bytes()).await?;
-//             file.flush().await?;
+async fn share_file(context: Context, file: &str) -> Result<()> {
+    let tag = context
+        .store()
+        .add_path(std::path::absolute(&file)?)
+        .await?;
+    let ticket = BlobTicket::new(context.endpoint().id().into(), tag.hash, tag.format);
+    let ticket = ticket.to_string();
+    output!(context, "!! Ticket for {}: {}", file, ticket);
+    let file_name = Path::new(file)
+        .file_name()
+        .ok_or_else(|| anyhow!("Wrong file name"))?
+        .to_str()
+        .ok_or_else(|| anyhow!("File name is not UTF-8"))?;
+    let msg = Message::new_message(format!("Sharing {file_name} with ticket {ticket}"));
+    context.send_message(msg).await;
 
-//             println!("Ticket: \n{}", ticket);
-//             let router = Router::builder(endpoint).spawn();
-//             tokio::signal::ctrl_c().await?;
-//             router.shutdown().await?;
-//         }
-//         CliCommand::Receive { ticket, file } => {
-//             let store = MemStore::new();
-//             let ticket: BlobTicket = ticket.parse()?;
-//             let output_file = path::absolute(&file)?;
-//             let downloader = store.downloader(&endpoint);
-//             downloader
-//                 .download(ticket.hash(), Some(ticket.addr().id))
-//                 .await?;
-//             store.blobs().export(ticket.hash(), output_file).await?;
-//             endpoint.close().await;
-//         }
+    Ok(())
+}
 
-async fn run(context: Context) -> Result<()> {
+async fn download_ticket(context: Context, ticket: &str, output_file: Option<&str>) -> Result<()> {
+    let ticket: BlobTicket = ticket.parse()?;
+    let output_file = output_file.map(PathBuf::from).unwrap_or_else(|| {
+        context
+            .data_dir()
+            .join("downloads")
+            .join(ticket.hash().to_string())
+    });
+    let output_file = std::path::absolute(output_file)?;
+
+    let downloader = context.downloader();
+    downloader
+        .download(ticket.hash(), Some(ticket.addr().id))
+        .await?;
+    context
+        .store()
+        .blobs()
+        .export(ticket.hash(), &output_file)
+        .await?;
+    output!(context, "!! Downloaded to {}", output_file.display());
+    Ok(())
+}
+
+async fn run(
+    context: Context,
+    output_sync: tokio::sync::mpsc::Receiver<String>,
+    mut input_receiver: tokio::sync::mpsc::Receiver<Command>,
+) -> Result<()> {
     let endpoint = context.endpoint();
 
     // Blobs config
@@ -122,29 +162,46 @@ async fn run(context: Context) -> Result<()> {
         .spawn();
 
     let (sender, receiver) = start_chat(&context, gossip).await?;
-    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel::<Command>(1);
 
-    tokio::spawn(message_loop(
-        receiver,
-        input_sender.clone(),
-        context.clone(),
-    ));
+    tokio::spawn(message_loop(receiver, context.clone()));
 
-    std::thread::spawn(move || input_loop(input_sender));
+    let mut line_reader = rustyline::DefaultEditor::new()?;
+    let printer: Box<dyn rustyline::ExternalPrinter + Send> =
+        Box::new(line_reader.create_external_printer()?);
+
+    std::thread::spawn(move || output_loop(output_sync, printer));
+    let input_sender = context.input_sender();
+    std::thread::spawn(move || input_loop(input_sender, line_reader));
 
     while let Some(cmd) = input_receiver.recv().await {
         match cmd {
-            Command::Share { file } => todo!(),
+            Command::Share { file } => {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    match share_file(context.clone(), &file).await {
+                        Ok(_) => output!(context, "!! File {file} was shared"),
+                        Err(e) => output!(context, "!! Error sharing file: {e}"),
+                    }
+                });
+            }
             Command::Download {
                 ticket,
                 output_file,
-            } => todo!(),
+            } => {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    match download_ticket(context.clone(), &ticket, output_file.as_deref()).await {
+                        Ok(_) => (),
+                        Err(e) => output!(context, "!! Error downloading file: {e}"),
+                    }
+                });
+            }
             Command::Message(message) => {
                 let data: Vec<u8> = message.sign_and_encode(endpoint.secret_key())?;
                 sender.broadcast(data.into()).await?;
             }
             Command::Quit => {
-                println!("!! Goodbye");
+                output!(context, "!! Goodbye\n");
                 break;
             }
         }
@@ -185,12 +242,8 @@ async fn start_chat(
     Ok((sender, receiver))
 }
 
-async fn message_loop(
-    mut receiver: GossipReceiver,
-    input_sender: tokio::sync::mpsc::Sender<Command>,
-    context: Context,
-) -> Result<()> {
-    let mut directory: HashMap<_, String> = HashMap::new();
+async fn message_loop(mut receiver: GossipReceiver, context: Context) -> Result<()> {
+    let directory = context.peers();
     while let Some(event) = receiver.next().await {
         let event = event?;
         match event {
@@ -204,59 +257,99 @@ async fn message_loop(
                 };
                 match message.body {
                     MessageBody::Message { text } => {
-                        let short_id = from.fmt_short().to_string();
-                        let name = directory
-                            .get(&from)
-                            .map(|name| format!("[{name}:{short_id}]"))
-                            .unwrap_or_else(|| format!("[{short_id}]"));
-                        println!("<< {}: {}", name, text);
+                        let name = directory.friendly_name(&from);
+                        output!(context, "<< {}: {}", name, text);
                     }
                     MessageBody::Intro { name } => {
-                        let existing = directory.insert(from, name.clone());
+                        let existing = directory.add_peer(from, name.clone());
+                        let short_id = from.fmt_short();
                         if let Some(old_name) = existing {
-                            if old_name != name {
-                                println!(
+                            if *old_name != name {
+                                output!(
+                                    context,
                                     "<< User {} changed name from {} to {}",
-                                    from, old_name, name
+                                    short_id,
+                                    old_name,
+                                    name
                                 );
                             }
                         } else {
-                            println!("<< User {} joined with name {}", from, name);
+                            output!(context, "<< User {} joined with name {}", short_id, name);
                         }
                     }
                 }
             }
             Event::NeighborUp(id) => {
-                println!("<< New user {} just joined", id.fmt_short());
+                output!(context, "<< New user {} just joined", id.fmt_short());
                 let intro = Message::new_intro(context.identity().into());
-                let intro = Command::Message(intro);
-                input_sender.send(intro).await?;
+                context.send_message(intro).await;
             }
             Event::NeighborDown(id) => {
-                println!("<< User {} just left", id.fmt_short());
+                let name = directory.friendly_name(&id);
+                output!(context, "<< User {} just left", name);
             }
             Event::Lagged => {
-                println!("<< Lagged - some messages were lost");
+                output!(context, "<< Lagged - some messages were lost");
             }
         }
     }
     Ok(())
 }
 
-fn input_loop(sender: tokio::sync::mpsc::Sender<Command>) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut buf = String::new();
+fn output_loop(
+    mut output_receiver: tokio::sync::mpsc::Receiver<String>,
+    mut printer: Box<dyn rustyline::ExternalPrinter>,
+) {
+    while let Some(msg) = output_receiver.blocking_recv() {
+        printer
+            .print(msg)
+            .inspect_err(|e| error!("Output error: {e}"))
+            .ok();
+    }
+}
+
+fn input_loop(
+    sender: tokio::sync::mpsc::Sender<Command>,
+    mut rl: rustyline::DefaultEditor,
+) -> Result<()> {
+    use rustyline::error::ReadlineError;
+
     loop {
-        // print!("\n>> ");
-        stdin.read_line(&mut buf)?;
-        let text = buf.trim_end().to_string();
-        if !text.is_empty() {
-            let parsed: Result<Command, _> = text.parse();
-            match parsed {
-                Ok(cmd) => sender.blocking_send(cmd)?,
-                Err(e) => println!("!! Invalid command {text}, error: {e}"),
+        let readline = rl.readline(">> ");
+        match readline {
+            Ok(line) => {
+                rl.add_history_entry(line.as_str())?;
+                let text = line.trim_end().to_string();
+                if !text.is_empty() {
+                    let parsed: Result<Command, _> = text.parse();
+                    match parsed {
+                        Ok(cmd) => {
+                            let is_end = matches!(cmd, Command::Quit);
+                            sender.blocking_send(cmd)?;
+                            if is_end {
+                                break;
+                            }
+                        }
+                        Err(e) => println!("!! Invalid command {text}, error: {e}"),
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("!! CTRL-C");
+                sender.blocking_send(Command::Quit)?;
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                sender.blocking_send(Command::Quit)?;
+                break;
+            }
+            Err(err) => {
+                println!("!! Input error: {:?}", err);
+                sender.blocking_send(Command::Quit)?;
+                break;
             }
         }
-        buf.clear();
     }
+    Ok(())
 }
